@@ -24,9 +24,13 @@ E4M3_MAX = 448.0
 #: `act_type` for SwiGlu, the only activation this entry certifies.
 ACT_TYPE_SWIGLU = 0
 
-#: The widest unchunked call a stock engine issues: trtllm's default
-#: `max_num_tokens`. A caller whose own token count exceeds it must chunk.
+#: The widest unchunked call a stock engine issues on one rank's own rows:
+#: trtllm's default `max_num_tokens`. A caller whose own token count exceeds it
+#: must chunk. An attention-DP all-to-all receive region (every rank's slots, as
+#: stock's MoE runs it in one call up to `moe_max_num_tokens` = `max_num_tokens`
+#: x the DP size) is certified up to `MAX_CERTIFIED_REGION_TOKENS`.
 MAX_CERTIFIED_TOKENS = 8192
+MAX_CERTIFIED_REGION_TOKENS = 32768
 
 #: The 16 e2m1 code points in code order: sign bit 3, exponent bits 2:1,
 #: mantissa bit 0.
@@ -133,6 +137,10 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
             spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **R1),
         ),
+        Cell(
+            why="an attention-DP receive region past the 8192-row column (stock: one call up to max_num_tokens x DP)",
+            spec=dict(tokens=32768, local_expert_offset=64, local_num_experts=64, **R1),
+        ),
     )
 
     note = """
@@ -148,10 +156,22 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     pair before dispatch, and `routing_method_type` 0, 2, 4, 5, 6 were measured
     bitwise identical to 1 there. It picks its permutation kernel by row count
     instead: a static-block kernel up to 4 rows, a dynamic-block one up to 16
-    rows only at <= 256 experts, a single-cluster one up to 8192 rows.
+    rows only at <= 256 experts, a single-cluster one up to 8192 rows, and a
+    multi-cluster one past that (the 32768-row receive-region cell).
 
     `act_type` 0 (SwiGlu) only. `gemm1_bias`, `gemm1_alpha`, `gemm1_beta`,
-    `gemm1_clamp_limit` and `gemm2_bias` are `None`. `hidden_states_scale` is
+    `gemm1_clamp_limit` and `gemm2_bias` are `None` at every cell above.
+
+    `gemm1_clamp_limit` is in accumulator units. The kernel clamps the FC1
+    accumulator, before `output1_scale_gate_scalar[e]` turns it into real
+    values. A model whose checkpoint defines the clamp in real units (a SwiGLU
+    limit `L`: up clamped to `[-L, L]`, gate to at most `L`; DeepSeek-V4.1's
+    `swiglu_limit`) must pass `L / output1_scale_gate_scalar` per local expert.
+    Passing `L` itself clamps almost nothing: the kernel accepts it, and the
+    result is as wrong as an unclamped one (relative error 0.97 against a
+    clamped torch reference, 0.24 for `L / scalar` at the test's geometry).
+    `test_gemm1_clamp_limit_is_in_accumulator_units` pins this on random
+    weights; the deepseek_v41 targets are the callers. `hidden_states_scale` is
     the linear (unswizzled) e4m3 block-scale layout, one scale per 16 elements
     of each row.
 
@@ -160,7 +180,8 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
 
     `tune_max_num_tokens` is an autotuner bucket hint and was measured inert;
     it is not a token count. `T` is `hidden_states.shape[0]`, and 8192 is the
-    top of the certified column. A warm autotuner cache was measured bitwise
+    top of the certified column for a rank's own rows; an attention-DP receive
+    region is certified up to 32768 rows. A warm autotuner cache was measured bitwise
     inert against a cold one at the R1 stack, its windows and the 512-expert
     stack; `local_num_experts` separates the tuner's cache entries, so each
     layout warms its own.

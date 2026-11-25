@@ -79,3 +79,15 @@ moonshotai/Kimi-K3:
 zai-org/GLM-5.3-Flash:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 77.22
+# DeepSeek-V4.1-Flash-NVFP4 (hf_quant_config MIXED_PRECISION, FP8 KV cache), image + text through the modeling_v2
+# deepseek_v41 targets' image classes. Reference: the built-in implementation on the same engine (dep2 layout: TP2 +
+# attention DP + MoE EP2, GB300), lm_eval's mmmu_val prompts and scoring, the checkpoint's chat template in its
+# non-thinking mode, greedy, 512 generated tokens: 65.00 and 64.67 over two runs (n=900; the two runs disagree on 119
+# questions). The dep2 target scored 63.44 and 63.67 on the same protocol (paired with the built-in runs: 117-143
+# disagreements, the same churn as the built-in's own two runs); tep8_moe_tp4_ep2 64.00 and 64.67 vs the built-in 64.33
+# twice (n=900). Teacher-forced on the same prompts (dep2, paired over the 900 questions), the target's log-likelihood
+# of the built-in's greedy answers is within the built-in's run-to-run spread, and of the reference answers higher.
+deepseek-ai/DeepSeek-V4.1-Flash:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 64.83
